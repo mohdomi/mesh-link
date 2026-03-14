@@ -10,16 +10,20 @@
  *   2. WebSocket Server
  *   3. Peer Manager (WebSocket Client)
  *   4. Gossip Router
+ *   5. Routing Priority (Heartbeat + Latency-based relay selection)
+ *   6. Self Healing (built into close/error handlers — gossip IS the heal)
+ *   7. Ink TUI (src/App.js)
+ *   8. SOS Broadcast (Ctrl+S in TUI)
  */
 
-'use strict';
-
-const dgram = require('dgram');
-const os = require('os');
-const crypto = require('crypto');
-const readline = require('readline');
-const { WebSocketServer, WebSocket } = require('ws');
-const { v4: uuidv4 } = require('uuid');
+import dgram from 'dgram';
+import os from 'os';
+import crypto from 'crypto';
+import { WebSocketServer, WebSocket } from 'ws';
+import { v4 as uuidv4 } from 'uuid';
+import React from 'react';
+import { render } from 'ink';
+import App from './src/App.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIG & NODE IDENTITY
@@ -31,6 +35,7 @@ const SEEN_MSG_TTL = 60000;          // 60 seconds before purging seen msgIds
 const DEFAULT_MSG_TTL = 10;          // default hop limit for messages
 const RECONNECT_ATTEMPTS = 3;
 const RECONNECT_DELAY = 2000;        // 2 seconds
+const HEARTBEAT_INTERVAL = 5000;     // 5 seconds between heartbeat pings
 
 // Generate unique node ID: "node-" + 6 random hex chars
 const nodeId = 'node-' + crypto.randomBytes(3).toString('hex');
@@ -63,8 +68,9 @@ const lanIP = getLanIP();
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * peers Map: nodeId -> { ws, ip, port, connectedAt }
+ * peers Map: nodeId -> { ws, ip, port, latency, connectedAt }
  * Stores all live peer connections (both inbound and outbound).
+ * latency is measured in ms via HEARTBEAT round-trip time.
  */
 const peers = new Map();
 
@@ -88,15 +94,52 @@ const discoveredAddresses = new Set();
 const reconnectAttempts = new Map();
 
 /**
- * Network event log — stores last N events for display.
+ * pendingHeartbeats Map: peerId -> sentAt timestamp
+ * Tracks outgoing heartbeat pings awaiting ACK to measure RTT.
+ */
+const pendingHeartbeats = new Map();
+
+/**
+ * chatMessages — array of { fromNodeId, text, type, hops, timestamp }
+ * Displayed in the TUI chat panel.
+ */
+const chatMessages = [];
+
+/**
+ * networkEvents — array of event strings for TUI display.
  */
 const networkEvents = [];
+
+/**
+ * TUI update callback — set by App.js to trigger re-renders.
+ */
+let tuiUpdateCallback = null;
+
+function setTuiUpdateCallback(cb) {
+  tuiUpdateCallback = cb;
+}
+
+function triggerTuiUpdate() {
+  if (tuiUpdateCallback) tuiUpdateCallback();
+}
 
 function addNetworkEvent(msg) {
   const entry = `[${new Date().toLocaleTimeString()}] ${msg}`;
   networkEvents.push(entry);
-  if (networkEvents.length > 20) networkEvents.shift();
-  console.log(`\x1b[33m⚡ ${entry}\x1b[0m`); // yellow
+  if (networkEvents.length > 50) networkEvents.shift();
+  triggerTuiUpdate();
+}
+
+function addChatMessage(fromNodeId, text, type, hops) {
+  chatMessages.push({
+    fromNodeId,
+    text,
+    type,
+    hops,
+    timestamp: new Date().toLocaleTimeString(),
+  });
+  if (chatMessages.length > 200) chatMessages.shift();
+  triggerTuiUpdate();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -207,7 +250,21 @@ function handleIncomingMessage(envelope, senderPeerId) {
 
   const serialized = JSON.stringify(forwardEnvelope);
 
-  for (const [peerId, peer] of peers) {
+  // ── STEP 6b: PRIORITY SORTING (Module 5) ────────────────────────────
+  // Sort peers by:
+  //   1) Latency ascending (fastest peers first — lower RTT = better)
+  //   2) Connection age descending (older = more stable, tiebreaker)
+  // We still flood to ALL peers, but lowest-latency peers get the
+  // message first. This gives a "priority routing feel" while
+  // maintaining the reliability of full gossip flooding.
+  const sortedPeers = [...peers.entries()].sort((a, b) => {
+    const latA = a[1].latency ?? Infinity;
+    const latB = b[1].latency ?? Infinity;
+    if (latA !== latB) return latA - latB; // lower latency first
+    return a[1].connectedAt - b[1].connectedAt; // older connection first
+  });
+
+  for (const [peerId, peer] of sortedPeers) {
     // Don't send back to whoever sent it to us
     if (peerId === senderPeerId) continue;
     // Don't send to the original author
@@ -229,15 +286,13 @@ function handleIncomingMessage(envelope, senderPeerId) {
  */
 function deliverLocally(envelope) {
   const { fromNodeId, type, payload, path } = envelope;
-  const timestamp = new Date().toLocaleTimeString();
   const hops = path.length;
 
   if (type === 'CHAT') {
-    console.log(`\x1b[36m[${timestamp}] [${fromNodeId}] (${hops} hops):\x1b[0m ${payload}`);
+    addChatMessage(fromNodeId, payload, 'CHAT', hops);
   } else if (type === 'SOS') {
-    console.log(`\x1b[31m🚨 SOS [${timestamp}] [${fromNodeId}] (${hops} hops): ${payload}\x1b[0m`);
+    addChatMessage(fromNodeId, payload, 'SOS', hops);
   } else if (type === 'PEER_LIST') {
-    // Could be used for peer exchange in the future
     addNetworkEvent(`Received peer list from ${fromNodeId}`);
   }
 }
@@ -263,12 +318,7 @@ function sendMessage(text, type = 'CHAT') {
   seenMessages.set(envelope.msgId, Date.now());
 
   // Display locally
-  const timestamp = new Date().toLocaleTimeString();
-  if (type === 'CHAT') {
-    console.log(`\x1b[32m[${timestamp}] [you/${nodeId}]:\x1b[0m ${text}`);
-  } else if (type === 'SOS') {
-    console.log(`\x1b[31m🚨 SOS [${timestamp}] [you/${nodeId}]: ${text}\x1b[0m`);
-  }
+  addChatMessage(nodeId, text, type, 0);
 
   // Flood to all peers
   const serialized = JSON.stringify(envelope);
@@ -288,8 +338,10 @@ function sendMessage(text, type = 'CHAT') {
 // who the connecting node is, then add it to our peers Map.
 //
 
-const wss = new WebSocketServer({ port: WS_PORT }, () => {
-  console.log(`\x1b[35m🔌 WebSocket server listening on port ${WS_PORT}\x1b[0m`);
+const wss = new WebSocketServer({ port: WS_PORT });
+
+wss.on('listening', () => {
+  addNetworkEvent(`WebSocket server listening on port ${WS_PORT}`);
 });
 
 wss.on('connection', (ws, req) => {
@@ -325,10 +377,28 @@ wss.on('connection', (ws, req) => {
         ws,
         ip: msg.ip || req.socket.remoteAddress,
         port: msg.wsPort,
+        latency: null,
         connectedAt: Date.now(),
       });
 
       addNetworkEvent(`Node ${remotePeerId} connected (inbound) — ${peers.size} peers total`);
+      return;
+    }
+
+    // ── HEARTBEAT handling (point-to-point, NOT gossip-flooded) ────────
+    // When we receive a HEARTBEAT ping, immediately reply with HEARTBEAT_ACK
+    // so the sender can measure round-trip time.
+    if (msg.type === 'HEARTBEAT') {
+      ws.send(JSON.stringify({ type: 'HEARTBEAT_ACK', sentAt: msg.sentAt, fromNodeId: nodeId }));
+      return;
+    }
+
+    // When we receive a HEARTBEAT_ACK, calculate RTT and update peer latency.
+    if (msg.type === 'HEARTBEAT_ACK') {
+      if (remotePeerId && peers.has(remotePeerId)) {
+        const rtt = Date.now() - msg.sentAt;
+        peers.get(remotePeerId).latency = rtt;
+      }
       return;
     }
 
@@ -338,18 +408,22 @@ wss.on('connection', (ws, req) => {
     }
   });
 
+  // ── MODULE 6: SELF HEALING (inbound connections) ────────────────────
+  // When a peer disconnects, remove from peers Map and log heal event.
+  // No special rerouting needed — gossip flooding inherently self-heals
+  // because messages are flooded to ALL remaining peers anyway.
   ws.on('close', () => {
     if (remotePeerId && peers.has(remotePeerId)) {
       peers.delete(remotePeerId);
-      addNetworkEvent(`Node ${remotePeerId} disconnected — network healed, ${peers.size} peers remaining`);
+      addNetworkEvent(`Node ${remotePeerId} left — network healed, ${peers.size} peers remaining`);
       if (peers.size === 0) {
         addNetworkEvent('Isolated — waiting for peers');
       }
     }
   });
 
-  ws.on('error', (err) => {
-    // Errors typically precede close events; just log quietly
+  ws.on('error', () => {
+    // Errors typically precede close events; healing handled in 'close'
   });
 });
 
@@ -395,6 +469,7 @@ function connectToPeer(ip, port, peerId, attempt = 1) {
       ws,
       ip,
       port,
+      latency: null,
       connectedAt: Date.now(),
     });
 
@@ -411,13 +486,31 @@ function connectToPeer(ip, port, peerId, attempt = 1) {
     } catch {
       return; // Ignore malformed messages
     }
+
+    // ── HEARTBEAT handling on outbound connections ─────────────────────
+    if (msg.type === 'HEARTBEAT') {
+      ws.send(JSON.stringify({ type: 'HEARTBEAT_ACK', sentAt: msg.sentAt, fromNodeId: nodeId }));
+      return;
+    }
+
+    if (msg.type === 'HEARTBEAT_ACK') {
+      if (peers.has(peerId)) {
+        const rtt = Date.now() - msg.sentAt;
+        peers.get(peerId).latency = rtt;
+      }
+      return;
+    }
+
     handleIncomingMessage(msg, peerId);
   });
 
+  // ── MODULE 6: SELF HEALING (outbound connections) ─────────────────────
+  // On disconnect: remove peer, log heal, attempt reconnection up to 3 times.
+  // Gossip flooding inherently handles rerouting — no special logic needed.
   ws.on('close', () => {
     if (peers.has(peerId)) {
       peers.delete(peerId);
-      addNetworkEvent(`Node ${peerId} disconnected — network healed, ${peers.size} peers remaining`);
+      addNetworkEvent(`Node ${peerId} left — network healed, ${peers.size} peers remaining`);
       if (peers.size === 0) {
         addNetworkEvent('Isolated — waiting for peers');
       }
@@ -440,7 +533,7 @@ function connectToPeer(ip, port, peerId, attempt = 1) {
     }
   });
 
-  ws.on('error', (err) => {
+  ws.on('error', () => {
     // Error events are followed by close events, so reconnection
     // logic is handled in the 'close' handler above.
   });
@@ -484,12 +577,12 @@ udpSocket.on('message', (data, rinfo) => {
 });
 
 udpSocket.on('error', (err) => {
-  console.error(`UDP error: ${err.message}`);
+  addNetworkEvent(`UDP error: ${err.message}`);
 });
 
 udpSocket.bind(UDP_PORT, () => {
   udpSocket.setBroadcast(true);
-  console.log(`\x1b[35m📡 UDP discovery listening on port ${UDP_PORT}\x1b[0m`);
+  addNetworkEvent(`UDP discovery listening on port ${UDP_PORT}`);
 
   // Broadcast our presence every 2 seconds
   setInterval(() => {
@@ -499,84 +592,55 @@ udpSocket.bind(UDP_PORT, () => {
       wsPort: WS_PORT,
     });
 
-    udpSocket.send(announcement, 0, announcement.length, UDP_PORT, '255.255.255.255', (err) => {
-      // Silently ignore broadcast errors (e.g., no network)
+    udpSocket.send(announcement, 0, announcement.length, UDP_PORT, '255.255.255.255', () => {
+      // Silently ignore broadcast errors
     });
   }, UDP_BROADCAST_INTERVAL);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CLI INTERFACE (temporary — will be replaced by Ink TUI in step 7)
+// MODULE 5: HEARTBEAT (Latency Measurement)
 // ─────────────────────────────────────────────────────────────────────────────
+//
+// Every 5 seconds, send a HEARTBEAT message to each connected peer.
+// The peer replies with HEARTBEAT_ACK containing the original sentAt timestamp.
+// We calculate RTT = Date.now() - sentAt and store it as peer.latency.
+// This latency is used by the gossip router to prioritize faster peers.
+//
 
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-  prompt: '',
-});
+setInterval(() => {
+  const heartbeat = JSON.stringify({
+    type: 'HEARTBEAT',
+    sentAt: Date.now(),
+    fromNodeId: nodeId,
+  });
 
-rl.on('line', (input) => {
-  const text = input.trim();
-  if (!text) return;
-
-  // Commands
-  if (text === '/peers') {
-    console.log('\x1b[35m── Connected Peers ──\x1b[0m');
-    if (peers.size === 0) {
-      console.log('  No peers connected');
+  for (const [peerId, peer] of peers) {
+    if (peer.ws.readyState === WebSocket.OPEN) {
+      peer.ws.send(heartbeat);
     }
-    for (const [id, p] of peers) {
-      const uptime = Math.round((Date.now() - p.connectedAt) / 1000);
-      console.log(`  ${id} @ ${p.ip}:${p.port} (up ${uptime}s)`);
-    }
-    return;
   }
-
-  if (text === '/events') {
-    console.log('\x1b[35m── Network Events ──\x1b[0m');
-    for (const e of networkEvents.slice(-10)) {
-      console.log(`  ${e}`);
-    }
-    return;
-  }
-
-  if (text === '/help') {
-    console.log('\x1b[35m── Commands ──\x1b[0m');
-    console.log('  /peers   — Show connected peers');
-    console.log('  /events  — Show recent network events');
-    console.log('  /sos     — Send SOS broadcast');
-    console.log('  /help    — Show this help');
-    console.log('  (anything else is sent as a chat message)');
-    return;
-  }
-
-  if (text.startsWith('/sos')) {
-    const sosMsg = text.slice(4).trim() || 'EMERGENCY';
-    sendMessage(sosMsg, 'SOS');
-    return;
-  }
-
-  // Regular chat message
-  sendMessage(text, 'CHAT');
-});
+}, HEARTBEAT_INTERVAL);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STARTUP
+// MODULE 7: INK TUI
 // ─────────────────────────────────────────────────────────────────────────────
 
-console.log('');
-console.log(`\x1b[1m\x1b[36m╔══════════════════════════════════════════════╗\x1b[0m`);
-console.log(`\x1b[1m\x1b[36m║         MeshLink — LAN Mesh Chat             ║\x1b[0m`);
-console.log(`\x1b[1m\x1b[36m╚══════════════════════════════════════════════╝\x1b[0m`);
-console.log(`\x1b[1m  Node ID:  ${nodeId}\x1b[0m`);
-console.log(`\x1b[1m  LAN IP:   ${lanIP}\x1b[0m`);
-console.log(`\x1b[1m  WS Port:  ${WS_PORT}\x1b[0m`);
-console.log(`\x1b[1m  Type /help for commands\x1b[0m`);
-console.log('');
+const { waitUntilExit } = render(
+  React.createElement(App, {
+    nodeId,
+    lanIP,
+    wsPort: WS_PORT,
+    peers,
+    chatMessages,
+    networkEvents,
+    sendMessage,
+    setTuiUpdateCallback,
+  })
+);
 
 // Graceful shutdown
 process.on('SIGINT', () => {
-  console.log('\n\x1b[33mShutting down MeshLink...\x1b[0m');
   udpSocket.close();
   wss.close();
   for (const [, peer] of peers) {
