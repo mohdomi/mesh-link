@@ -1,0 +1,16 @@
+{
+  "name": "meshlink",
+  "version": "1.0.0",
+  "description": "Serverless LAN Mesh Chat — fully decentralized, self-healing gossip network",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0",
+    "uuid": "^9.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
