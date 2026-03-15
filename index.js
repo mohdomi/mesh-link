@@ -446,7 +446,7 @@ function handlePeerExchange(msg) {
 // who the connecting node is, then add it to our peers Map.
 //
 
-const wss = new WebSocketServer({ port: WS_PORT });
+const wss = new WebSocketServer({ port: WS_PORT, perMessageDeflate: false });
 
 wss.on('listening', () => {
   addNetworkEvent(`WebSocket server listening on port ${WS_PORT}`);
@@ -454,6 +454,11 @@ wss.on('listening', () => {
 
 wss.on('connection', (ws, req) => {
   let remotePeerId = null;
+
+  // Enable TCP keepalive on the underlying socket to prevent Android NAT expiry
+  if (req.socket) {
+    req.socket.setKeepAlive(true, 10000);
+  }
 
   ws.on('message', (data) => {
     let msg;
@@ -603,6 +608,15 @@ function connectToPeer(ip, port, peerId, attempt = 1, relayNodeId = null) {
 
     // Share our known peers so the remote node discovers the full mesh instantly
     sendPeerList(ws, peerId);
+
+    // Listen for pong on outbound connections
+    ws.on('pong', () => {
+      const p = peers.get(peerId);
+      if (p) {
+        p._pongPending = false;
+        if (p._pongTimer) { clearTimeout(p._pongTimer); p._pongTimer = null; }
+      }
+    });
   });
 
   ws.on('message', (data) => {
@@ -850,6 +864,57 @@ setInterval(() => {
     }
   }
 }, 30000);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WS KEEPALIVE (Ping/Pong) — Prevents Android NAT expiry
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Every 10 seconds, send a WebSocket-level ping() to each peer.
+// If pong is not received within 5 seconds, the connection is dead
+// (Android NAT expired, WiFi dropped, etc). Terminate it so
+// self-healing (reconnect + gossip reroute) kicks in immediately
+// instead of waiting for TCP timeout (which can be 2+ minutes).
+//
+
+const WS_PING_INTERVAL = 10000;   // ping every 10 seconds
+const WS_PONG_TIMEOUT = 5000;     // consider dead if no pong in 5s
+
+setInterval(() => {
+  peers.forEach((peer, peerId) => {
+    if (peer.ws.readyState !== WebSocket.OPEN) return;
+
+    // If we were already waiting for a pong and it never came, kill it
+    if (peer._pongPending) {
+      peer.ws.terminate(); // triggers 'close' event → self-healing
+      return;
+    }
+
+    // Send ping frame, mark as waiting for pong
+    peer._pongPending = true;
+    peer.ws.ping();
+
+    // Set a timeout — if pong doesn't arrive in 5s, flag for termination
+    peer._pongTimer = setTimeout(() => {
+      if (peer._pongPending && peer.ws.readyState === WebSocket.OPEN) {
+        peer.ws.terminate();
+      }
+    }, WS_PONG_TIMEOUT);
+  });
+}, WS_PING_INTERVAL);
+
+// Listen for pong responses on all WS server inbound connections
+wss.on('connection', (ws) => {
+  ws.on('pong', () => {
+    // Find which peer this ws belongs to and clear their pending flag
+    for (const [, peer] of peers) {
+      if (peer.ws === ws) {
+        peer._pongPending = false;
+        if (peer._pongTimer) { clearTimeout(peer._pongTimer); peer._pongTimer = null; }
+        break;
+      }
+    }
+  });
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MODULE 5: HEARTBEAT (Latency Measurement)
