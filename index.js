@@ -25,6 +25,7 @@ import { v4 as uuidv4 } from 'uuid';
 import React from 'react';
 import { render } from 'ink';
 import App from './src/App.js';
+import { startWebBridge } from './web-bridge.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIG & NODE IDENTITY
@@ -874,6 +875,12 @@ setInterval(() => {
     }
   }
 }, HEARTBEAT_INTERVAL);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MODULE 10: WEB UI BRIDGE
+// ─────────────────────────────────────────────────────────────────────────────
+
+startWebBridge({ nodeId, lanIP, wsPort: WS_PORT, peers, chatMessages, networkEvents, sendMessage });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MODULE 7: INK TUI

@@ -1,8 +1,4 @@
-/**
- * MeshLink TUI — Minimal, flat terminal UI.
- * Inspired by Claude Code / Codex CLI style: simple text, no heavy borders.
- * Uses React.createElement — no JSX, no build step.
- */
+
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { Box, Text, useInput, useApp, useStdout } from 'ink';
@@ -17,6 +13,7 @@ function App({ nodeId, lanIP, wsPort, peers, chatMessages, networkEvents, sendMe
   const { stdout } = useStdout();
 
   const rows = stdout?.rows || 24;
+  
 
   // Re-render callback for mesh engine state changes
   useEffect(() => {
